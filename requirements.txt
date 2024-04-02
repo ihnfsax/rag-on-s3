@@ -1,0 +1,9 @@
+openai
+python-dotenv
+lancedb
+PyMuPDF
+boto3
+botocore
+pandas
+pyarrow
+httpx
