@@ -12,6 +12,7 @@ import logging
 import pyarrow as pa
 import httpx
 import time
+import unicodedata
 
 logging.basicConfig(
     filename="rag.log",
@@ -21,13 +22,36 @@ logging.basicConfig(
 )
 
 
-def gen_text_chunks(text, max_length=4096):
+def find_pdf_files(directory):
+    pdf_files = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith(".pdf"):
+                pdf_files.append(os.path.join(root, file))
+    return pdf_files
+
+
+def get_text_chunks(text, chunk_size):
+    text = text.replace("\n", " ")
+    words = text.split()
+    word_size = 0
     chunks = []
-    while len(text) > max_length:
-        chunk = text[:max_length]
-        text = text[max_length:]
-        chunks.append(chunk)
-    chunks.append(text)
+    start = 0
+    for i, word in enumerate(words):
+        che_count = 0
+        for char in word:
+            if "\u0e00" <= char <= "\u9fa5":
+                che_count += 1
+        if che_count > 0:
+            word_size += che_count / 2
+        else:
+            word_size += 1
+        if word_size >= chunk_size:
+            chunks.append(" ".join(words[start:i]))
+            word_size = 0
+            start = i
+    if start < len(words) - 1:
+        chunks.append(" ".join(words[start:]))
     return chunks
 
 
@@ -37,25 +61,11 @@ class RAG:
         os.environ["AWS_SECRET_ACCESS_KEY"] = "minioadmin"
         os.environ["AWS_ENDPOINT"] = "http://127.0.0.1:9000"
         os.environ["AWS_DEFAULT_REGION"] = "ap-east-1"
-        session = boto3.Session()
-        self.s3 = session.client(
-            "s3",
-            aws_access_key_id="minioadmin",
-            aws_secret_access_key="minioadmin",
-            endpoint_url="http://127.0.0.1:9000",
-            region_name="ap-east-1",
-            config=botocore.config.Config(s3={"addressing_style": "path"}),
-        )
-        db_uri = f"s3://{vector_store_bucket}/"
-        self.db = lancedb.connect(db_uri)
-        self.table = "knowledge_base"
+        self.__init_s3()
         self.file_bucket = file_bucket
+        self.__init_vector_store(vector_store_bucket)
+        self.__init_openai()
         self.chunk_size = 512
-        self.openai = OpenAI(
-            http_client=httpx.Client(proxy="http://10.252.1.45:7890"),
-            api_key=os.environ["OPENAI_API_KEY"],
-            base_url="https://aihubmix.com/v1",
-        )
         self.embedding_model = "text-embedding-3-small"
         self.embedding_size = 1536
         self.schema = pa.schema(
@@ -67,13 +77,44 @@ class RAG:
                 pa.field("text_file_name", pa.string()),
             ]
         )
-        self.limit = 3  # 最多获取几个相似文本块作为上下文
+        self.limit = 5  # 最多获取几个相似文本块作为上下文
         pd.set_option("display.max_colwidth", None)
+
+    def __init_s3(self):
+        session = boto3.Session()
+        self.s3 = session.client(
+            "s3",
+            aws_access_key_id="minioadmin",
+            aws_secret_access_key="minioadmin",
+            endpoint_url="http://127.0.0.1:9000",
+            region_name="ap-east-1",
+            config=botocore.config.Config(s3={"addressing_style": "path"}),
+        )
+
+    def __init_vector_store(self, vector_store_bucket):
+        self.db = lancedb.connect(f"s3://{vector_store_bucket}/")
+        self.table = "knowledge_base"
+
+    def __init_openai(self):
+        openai_base_url = "https://api.openai.com/v1/"
+        if len(os.environ["OPENAI_BASE_URL"]):
+            openai_base_url = os.environ["OPENAI_BASE_URL"]
+        if len(os.environ["OPENAI_PROXY"]):
+            self.openai = OpenAI(
+                http_client=httpx.Client(proxy=os.environ["OPENAI_PROXY"]),
+                api_key=os.environ["OPENAI_API_KEY"],
+                base_url=openai_base_url,
+            )
+        else:
+            self.openai = OpenAI(
+                api_key=os.environ["OPENAI_API_KEY"],
+                base_url=openai_base_url,
+            )
 
     def load_pdf(self, pdf_path):
         logging.info(f"Loading pdf file: {pdf_path}")
         if not os.path.exists(pdf_path):
-            print("The pdf file does not exist.")
+            print(f"The pdf file does not exist: {pdf_path}")
             logging.info(f"The pdf file does not exist: {pdf_path}")
             return
 
@@ -98,15 +139,12 @@ class RAG:
         # 生成文本块
         text = text.replace("\n", " ")
         words = text.split()
-        print(f"Extracted {len(words)} words from the pdf file")
-        chunks = [
-            " ".join(words[i : i + self.chunk_size])
-            for i in range(0, len(words), self.chunk_size)
-        ]
+        print(f"Extracted {len(words)} words from the pdf file: {pdf_name}")
+        chunks = get_text_chunks(text, self.chunk_size)
         logging.info(
             f"Extracted {len(chunks)} text chunks from the pdf file: {pdf_path}"
         )
-        print(f"Extracted {len(chunks)} text chunks from the pdf file")
+        print(f"Extracted {len(chunks)} text chunks from the pdf file: {pdf_name}")
 
         # 生成文本块的embedding 并插入到 lancedb
         print("Generating embeddings...")
@@ -121,34 +159,8 @@ class RAG:
             if self.__add_embedding_to_db(embedding, chunk, i, pdf_name, text_name):
                 return
 
-        print("The pdf file has been loaded successfully.")
+        print(f"The pdf file has been loaded successfully: {pdf_name}")
         logging.info(f"The pdf file has been loaded successfully: {pdf_path}")
-
-    def clear_knowledge_base(self):
-        print("Are you sure to clear all data in S3? [Y/n]", end="")
-        clear = input()
-        if clear.lower() != "y":
-            return
-        try:
-            logging.info(f"Deleting table knowledge_base in LanceDB")
-            self.db.drop_table(self.table)
-            res = []
-            bucket = self.s3.list_objects(Bucket=self.file_bucket)
-            for obj_version in bucket["Contents"]:
-                key = obj_version["Key"]
-                res.append({"Key": key})
-
-            if len(res):
-                logging.info(
-                    f"Deleting all {len(res)} objects from bucket {self.file_bucket}"
-                )
-                self.s3.delete_objects(Bucket=self.file_bucket, Delete={"Objects": res})
-        except Exception as e:
-            print(e)
-            logging.error(e)
-            return
-        logging.info("Clear knowledge base done")
-        print("Clear knowledge base done.")
 
     def __upload_pdf_to_s3(self, pdf_path, text, text_name):
         pdf_name = os.path.basename(pdf_path)
@@ -160,10 +172,6 @@ class RAG:
             pass
         if is_exist:
             print("The pdf file already exists.")
-            # print("The pdf file already exists. Overwrite it? [Y/n]", end="")
-            # overwrite = input()
-            # if overwrite.lower() != "y":
-            #     return True
             return True
 
         logging.info(f"Upload pdf file: {pdf_name}")
@@ -207,6 +215,39 @@ class RAG:
             return True
         return False
 
+    def load_folder(self, folder_path):
+        logging.info(f"Loading pdf folder: {folder_path}")
+        if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
+            print("The pdf folder is invalid.")
+            logging.info(f"The pdf folder is invalid: {folder_path}")
+            return
+
+        pdf_files = find_pdf_files(folder_path)
+        if len(pdf_files) == 0:
+            print("No pdf files found in the folder.")
+            logging.info(f"No pdf files found in the folder: {folder_path}")
+            return
+
+        for pdf_path in pdf_files:
+            self.load_pdf(pdf_path)
+
+        print(f"Loaded {len(pdf_files)} pdf files in the folder: {folder_path}")
+        logging.info(f"Loaded {len(pdf_files)} pdf files in the folder: {folder_path}")
+
+    def create_index(self):
+        try:
+            table = self.db.create_table(self.table, schema=self.schema, exist_ok=True)
+            start = time.time()
+            print("Creating index...")
+            logging.info("Creating index...")
+            table.create_index(vector_column_name="embedding")
+            print(f"Done. Indexing time: {time.time() - start}")
+            logging.info(f"Done. Indexing time: {time.time() - start}")
+        except Exception as e:
+            print(e)
+            logging.error(e)
+        return
+
     def show_knowledge_base_infos(self):
         try:
             table = self.db.create_table(self.table, schema=self.schema, exist_ok=True)
@@ -219,11 +260,43 @@ class RAG:
             res = res.groupby("pdf_file_name").size().reset_index()
 
             print("\nKnowledge base infos:")
-            res.rename(columns={res.columns[1]: "chunk_size"}, inplace=True)
-            print(res)
+            pdf_number = res.shape[0]
+            sum_chunk_size = res[0].sum()
+            print(f"Total number of pdf files: {pdf_number}")
+            print(f"Total number of text chunks: {sum_chunk_size}")
         except Exception as e:
             print(e)
             logging.error(e)
+
+    def clear_knowledge_base(self):
+        print("Are you sure to clear all data in S3? [Y/n] ", end="")
+        clear = input()
+        if clear.lower() != "y":
+            return
+        logging.info(f"Deleting table knowledge_base in LanceDB")
+        try:
+            self.db.drop_table(self.table)
+        except Exception as e:
+            print(e)
+            logging.error(e)
+        try:
+            res = []
+            bucket = self.s3.list_objects(Bucket=self.file_bucket)
+            for obj_version in bucket["Contents"]:
+                key = obj_version["Key"]
+                res.append({"Key": key})
+
+            if len(res):
+                logging.info(
+                    f"Deleting all {len(res)} objects from bucket {self.file_bucket}"
+                )
+                self.s3.delete_objects(Bucket=self.file_bucket, Delete={"Objects": res})
+        except Exception as e:
+            print(e)
+            logging.error(e)
+            return
+        logging.info("Clear knowledge base done")
+        print("Clear knowledge base done.")
 
     def chat(self):
         print("Start chatting...")
@@ -289,27 +362,36 @@ if __name__ == "__main__":
 
     print("Initializing...")
     rag = RAG(vector_store_bucket="lance", file_bucket="blob")
+    logging.info("RAG initialized")
 
     print("Welcome to the chatbot!")
     while True:
         print("\noption 1: load new pdf file")
-        print("option 2: show knowledge base infos")
-        print("option 3: start chatting")
-        print("option 4: clear knowledge base")
-        print("option 5: exit\n")
+        print("option 2: load folder of pdf files")
+        print("option 3: show knowledge base infos")
+        print("option 4: create index")
+        print("option 5: start chatting")
+        print("option 6: clear knowledge base")
+        print("option 7: exit\n")
         option = input("Please select an option: ")
         if option == "1":
             pdf_path = input("Please enter the path of the pdf file: ")
             rag.load_pdf(pdf_path)
         elif option == "2":
-            rag.show_knowledge_base_infos()
+            folder_path = input("Please enter the path of the folder: ")
+            rag.load_folder(folder_path)
         elif option == "3":
-            rag.chat()
+            rag.show_knowledge_base_infos()
         elif option == "4":
-            rag.clear_knowledge_base()
+            rag.create_index()
         elif option == "5":
+            rag.chat()
+        elif option == "6":
+            rag.clear_knowledge_base()
+        elif option == "7":
             break
         else:
             print("Invalid option!")
 
     print("Goodbye!")
+    logging.info("RAG exited")
